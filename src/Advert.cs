@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Text;
+using AudioApi;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -13,7 +15,7 @@ using SwiftlyS2.Shared.Scheduler;
 
 namespace Advert;
 
-[PluginMetadata(Id = "Advert", Version = "1.0.0", Name = "Advert", Author = "E!N", Website = "https://nova-hosting.ru/?ref=ein")]
+[PluginMetadata(Id = "Advert", Version = "1.1.0", Name = "Advert", Author = "E!N", Website = "https://nova-hosting.ru/?ref=ein")]
 public class Advert : BasePlugin
 {
     private static readonly (string Tag, string Color)[] ColorReplacements =
@@ -41,9 +43,13 @@ public class Advert : BasePlugin
         ("{ORANGE}", Helper.ChatColors.Orange)
     ];
 
+    private readonly ConcurrentDictionary<string, IAudioSource> _decodedSources = new();
+
     private readonly ILogger _logger;
     private readonly ISchedulerService _scheduler;
+    private IAudioApi? _audioApi;
     private string? _cachedPanelMessage = string.Empty;
+    private int _channelCounter;
     private ConfigModel _config = new();
     private IOptionsMonitor<ConfigModel> _configMonitor = null!;
 
@@ -57,7 +63,19 @@ public class Advert : BasePlugin
     }
 
     public override void ConfigureSharedInterface(IInterfaceManager interfaceManager) { }
-    public override void UseSharedInterface(IInterfaceManager interfaceManager) { }
+
+    public override void UseSharedInterface(IInterfaceManager interfaceManager)
+    {
+        if (!interfaceManager.HasSharedInterface("audio"))
+        {
+            Core.Logger.LogWarning("Audio shared interface not found. Install/enable the 'Audio' plugin.");
+            _audioApi = null;
+            return;
+        }
+
+        var audioApi = interfaceManager.GetSharedInterface<IAudioApi>("audio");
+        _audioApi = audioApi;
+    }
 
     public override void Load(bool hotReload)
     {
@@ -83,6 +101,7 @@ public class Advert : BasePlugin
             {
                 _config = cfg;
                 _currentAdIndex = 0;
+                _decodedSources.Clear();
                 RestartTimer();
             });
 
@@ -168,6 +187,9 @@ public class Advert : BasePlugin
                             case AdvertLocationType.Alert:
                                 player.SendAlert(finalMessage);
                                 break;
+                            case AdvertLocationType.Sound:
+                                SoundAdvertising(finalMessage);
+                                break;
                         }
                     }
                 }
@@ -189,6 +211,51 @@ public class Advert : BasePlugin
             @event.FinalEvent = finalEvent;
             @event.FunfactToken = finalMessage;
         });
+    }
+
+    private void SoundAdvertising(string soundPath)
+    {
+        if (_audioApi == null) return;
+
+        if (string.IsNullOrWhiteSpace(soundPath)) return;
+
+        var resolvedPath = ResolvePath(soundPath);
+
+        if (!File.Exists(resolvedPath))
+        {
+            _logger.LogWarning("Audio file not found: {ResolvedPath}", resolvedPath);
+            return;
+        }
+
+        IAudioSource source;
+        try
+        {
+            source = _decodedSources.GetOrAdd(resolvedPath, path => _audioApi.DecodeFromFile(path));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to decode sound file: {ResolvedPath}", resolvedPath);
+            return;
+        }
+
+        var channelId = $"advert.{Interlocked.Increment(ref _channelCounter)}";
+        var channel = _audioApi.UseChannel(channelId);
+
+        channel.SetSource(source);
+
+        foreach (var player in Core.PlayerManager.GetAllPlayers())
+        {
+            if (!player.IsValid || player.IsFakeClient) continue;
+            channel.SetVolumeToAll(_config.Volume);
+            channel.Play(player.PlayerID);
+        }
+    }
+
+    private string ResolvePath(string configuredPath)
+    {
+        if (Path.IsPathRooted(configuredPath)) return configuredPath;
+        var dataPath = Path.Combine(Core.PluginDataDirectory, configuredPath);
+        return File.Exists(dataPath) ? dataPath : Path.Combine(Core.PluginPath, configuredPath);
     }
 
     private string ReplaceAllTags(string message)
@@ -232,6 +299,7 @@ public class Advert : BasePlugin
     public override void Unload()
     {
         _timerToken?.Cancel();
+        _decodedSources.Clear();
     }
 }
 
@@ -240,6 +308,8 @@ public class ConfigModel
     public float Interval { get; set; } = 15.0f;
 
     public int HtmlDuration { get; set; } = 5;
+
+    public float Volume { get; set; } = 0.5f;
 
     public Dictionary<string, string> MapsName { get; set; } = new()
     {
@@ -292,6 +362,13 @@ public class ConfigModel
             {
                 [AdvertLocationType.Alert] = "test in alert",
                 [AdvertLocationType.Chat] = "and in chat"
+            }
+        },
+        new()
+        {
+            ["test7"] = new Dictionary<AdvertLocationType, string>
+            {
+                [AdvertLocationType.Sound] = "test_in_audio.mp3"
             }
         }
     ];
