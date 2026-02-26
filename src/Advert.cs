@@ -15,7 +15,7 @@ using SwiftlyS2.Shared.Scheduler;
 
 namespace Advert;
 
-[PluginMetadata(Id = "Advert", Version = "1.1.3", Name = "Advert", Author = "E!N", Website = "https://nova-hosting.ru/?ref=ein")]
+[PluginMetadata(Id = "Advert", Version = "1.1.4", Name = "Advert", Author = "E!N", Website = "https://nova-hosting.ru/?ref=ein")]
 public class Advert : BasePlugin
 {
     private static readonly (string Tag, string Color)[] ColorReplacements =
@@ -61,6 +61,11 @@ public class Advert : BasePlugin
     private readonly object _centerLock = new();
     private CancellationTokenSource? _centerRepeatToken;
     private CancellationTokenSource? _centerStopToken;
+
+    // 1 db alert “refresh” timer (nem playerenként)
+    private readonly object _alertLock = new();
+    private CancellationTokenSource? _alertRepeatToken;
+    private CancellationTokenSource? _alertStopToken;
 
     public Advert(ISwiftlyCore core) : base(core)
     {
@@ -124,7 +129,7 @@ public class Advert : BasePlugin
                 return HookResult.Continue;
             });
 
-            // ÚJ: WelcomeMessage connect után
+            // WelcomeMessage connect után
             Core.GameEvent.HookPost<EventPlayerConnectFull>(OnPlayerConnectFull);
 
             StartTimer();
@@ -145,7 +150,6 @@ public class Advert : BasePlugin
         if (!_config.WelcomeEnabled) return HookResult.Continue;
         if (string.IsNullOrWhiteSpace(_config.WelcomeMessage)) return HookResult.Continue;
 
-        // Delay után küldjük (mint a puskázott plugin)
         _scheduler.DelayBySeconds(_config.WelcomeDelay, () =>
         {
             if (!player.IsValid) return;
@@ -159,16 +163,16 @@ public class Advert : BasePlugin
                     break;
 
                 case WelcomeLocationType.Center:
-                    // Sima centernek nincs duration overload, itt 1x küldjük
+                    // Welcome center: 1x (nem duration-ozzuk, mert könnyen spammy)
                     player.SendCenter(msg);
                     break;
 
                 case WelcomeLocationType.Html:
-                    // HTML-nek van duration-ja -> ezt ajánlom ha “maradjon kint”
                     player.SendCenterHTML(msg, _config.WelcomeHtmlDuration * 1000);
                     break;
 
                 case WelcomeLocationType.Alert:
+                    // Welcome alert: 1x (nem duration-ozzuk)
                     player.SendAlert(msg);
                     break;
             }
@@ -214,13 +218,21 @@ public class Advert : BasePlugin
                         continue;
                     }
 
-                    // Center: 1 timer / mindenki
+                    // Center: 1 timer / everyone
                     if (location == AdvertLocationType.Center)
                     {
                         SendCenterToAllWithDuration(finalMessage);
                         continue;
                     }
 
+                    // Alert: ugyanazt a duration-t használja mint a Center (config nem változik)
+                    if (location == AdvertLocationType.Alert)
+                    {
+                        SendAlertToAllWithDuration(finalMessage);
+                        continue;
+                    }
+
+                    // többi: per player egyszer
                     foreach (var player in Core.PlayerManager.GetAllPlayers())
                     {
                         if (!player.IsValid) continue;
@@ -235,10 +247,6 @@ public class Advert : BasePlugin
                                 player.SendCenterHTML(finalMessage, _config.HtmlDuration * 1000);
                                 break;
 
-                            case AdvertLocationType.Alert:
-                                player.SendAlert(finalMessage);
-                                break;
-
                             case AdvertLocationType.Sound:
                                 SoundAdvertising(finalMessage);
                                 break;
@@ -247,6 +255,17 @@ public class Advert : BasePlugin
                 }
             }
         };
+    }
+
+    private (float duration, float refreshEvery) GetDurationAndRefreshFromConfig()
+    {
+        var duration = _config.CenterDuration;
+
+        var refreshEvery = _config.CenterRefreshEvery;
+        if (refreshEvery < 0.5f) refreshEvery = 0.5f;
+        if (refreshEvery > 5.0f) refreshEvery = 5.0f;
+
+        return (duration, refreshEvery);
     }
 
     // 1 db timer, ami frissíti a center üzenetet mindenkinek
@@ -258,11 +277,8 @@ public class Advert : BasePlugin
             p.SendCenter(message);
         }
 
-        if (_config.CenterDuration <= 0f) return;
-
-        var refreshEvery = _config.CenterRefreshEvery;
-        if (refreshEvery < 0.5f) refreshEvery = 0.5f;
-        if (refreshEvery > 5.0f) refreshEvery = 5.0f;
+        var (duration, refreshEvery) = GetDurationAndRefreshFromConfig();
+        if (duration <= 0f) return;
 
         lock (_centerLock)
         {
@@ -282,7 +298,7 @@ public class Advert : BasePlugin
 
             _centerRepeatToken = repeatToken;
 
-            _centerStopToken = _scheduler.DelayBySeconds(_config.CenterDuration, () =>
+            _centerStopToken = _scheduler.DelayBySeconds(duration, () =>
             {
                 lock (_centerLock)
                 {
@@ -298,6 +314,55 @@ public class Advert : BasePlugin
 
             if (_centerStopToken != null)
                 _scheduler.StopOnMapChange(_centerStopToken);
+        }
+    }
+
+    // 1 db timer, ami frissíti az alert üzenetet mindenkinek (CenterDuration + CenterRefreshEvery alapján)
+    private void SendAlertToAllWithDuration(string message)
+    {
+        foreach (var p in Core.PlayerManager.GetAllPlayers())
+        {
+            if (!p.IsValid) continue;
+            p.SendAlert(message);
+        }
+
+        var (duration, refreshEvery) = GetDurationAndRefreshFromConfig();
+        if (duration <= 0f) return;
+
+        lock (_alertLock)
+        {
+            _alertRepeatToken?.Cancel();
+            _alertStopToken?.Cancel();
+
+            CancellationTokenSource? repeatToken = null;
+
+            repeatToken = _scheduler.DelayAndRepeatBySeconds(refreshEvery, refreshEvery, () =>
+            {
+                foreach (var p in Core.PlayerManager.GetAllPlayers())
+                {
+                    if (!p.IsValid) continue;
+                    p.SendAlert(message);
+                }
+            });
+
+            _alertRepeatToken = repeatToken;
+
+            _alertStopToken = _scheduler.DelayBySeconds(duration, () =>
+            {
+                lock (_alertLock)
+                {
+                    _alertRepeatToken?.Cancel();
+                    _alertRepeatToken = null;
+                    _alertStopToken?.Cancel();
+                    _alertStopToken = null;
+                }
+            });
+
+            if (_alertRepeatToken != null)
+                _scheduler.StopOnMapChange(_alertRepeatToken);
+
+            if (_alertStopToken != null)
+                _scheduler.StopOnMapChange(_alertStopToken);
         }
     }
 
@@ -360,7 +425,7 @@ public class Advert : BasePlugin
         return File.Exists(dataPath) ? dataPath : Path.Combine(Core.PluginPath, configuredPath);
     }
 
-    // ÚJ: player kontextus támogatás a {player}/{PLAYER} placeholderhez
+    // {player}/{PLAYER} támogatás welcome-hoz
     private string ReplaceAllTags(string message, IPlayer? player)
     {
         if (string.IsNullOrEmpty(message)) return message;
@@ -401,9 +466,7 @@ public class Advert : BasePlugin
         return sb.ToString();
     }
 
-    // Meglévő hirdetésekhez (player nélkül)
-    private string ReplaceAllTags(string message)
-        => ReplaceAllTags(message, player: null);
+    private string ReplaceAllTags(string message) => ReplaceAllTags(message, player: null);
 
     public override void Unload()
     {
@@ -417,6 +480,14 @@ public class Advert : BasePlugin
             _centerStopToken = null;
         }
 
+        lock (_alertLock)
+        {
+            _alertRepeatToken?.Cancel();
+            _alertStopToken?.Cancel();
+            _alertRepeatToken = null;
+            _alertStopToken = null;
+        }
+
         _decodedSources.Clear();
     }
 }
@@ -427,26 +498,19 @@ public class ConfigModel
 
     public int HtmlDuration { get; set; } = 5;
 
-    // Center hirdetések “hossza” (sec)
+    // Center + Alert duration (sec). 0 = send once.
     public float CenterDuration { get; set; } = 6.0f;
 
-    // Center refresh gyakoriság (sec) – 1.0–2.0 ajánlott
+    // Center + Alert refresh interval (sec). Recommended 1.0–2.0
     public float CenterRefreshEvery { get; set; } = 1.0f;
 
     public float Volume { get; set; } = 0.5f;
 
-    // ÚJ: Welcome
+    // Welcome
     public bool WelcomeEnabled { get; set; } = true;
-
-    // Másodperc
     public float WelcomeDelay { get; set; } = 2.0f;
-
-    // Üzenet (működik: {player}, {IP}, {PORT}, {SERVERNAME}, {DATE}, {TIME}, {MAP}, színek)
     public string WelcomeMessage { get; set; } = "{GREEN}ÜDV {player}{DEFAULT} a szerveren: {GOLD}{SERVERNAME}{DEFAULT}!";
-
     public WelcomeLocationType WelcomeLocation { get; set; } = WelcomeLocationType.Chat;
-
-    // csak akkor kell, ha WelcomeLocation == Html
     public int WelcomeHtmlDuration { get; set; } = 6;
 
     public Dictionary<string, string> MapsName { get; set; } = new()
@@ -465,49 +529,6 @@ public class ConfigModel
             {
                 [AdvertLocationType.Chat] = "test in chat"
             }
-        },
-        new()
-        {
-            ["test2"] = new Dictionary<AdvertLocationType, string>
-            {
-                [AdvertLocationType.Center] = "test in center"
-            }
-        },
-        new()
-        {
-            ["test3"] = new Dictionary<AdvertLocationType, string>
-            {
-                [AdvertLocationType.Alert] = "test in alert"
-            }
-        },
-        new()
-        {
-            ["test4"] = new Dictionary<AdvertLocationType, string>
-            {
-                [AdvertLocationType.Html] = "<b><font color='lime'>test in</font> <font color='white'>html</font></b>"
-            }
-        },
-        new()
-        {
-            ["test5"] = new Dictionary<AdvertLocationType, string>
-            {
-                [AdvertLocationType.Panel] = "<b><font color='lime'>test in</font> <font color='white'>panel</font></b>"
-            }
-        },
-        new()
-        {
-            ["test6"] = new Dictionary<AdvertLocationType, string>
-            {
-                [AdvertLocationType.Alert] = "test in alert",
-                [AdvertLocationType.Chat] = "and in chat"
-            }
-        },
-        new()
-        {
-            ["test7"] = new Dictionary<AdvertLocationType, string>
-            {
-                [AdvertLocationType.Sound] = "test_in_audio.mp3"
-            }
         }
     ];
 }
@@ -524,8 +545,8 @@ public enum AdvertLocationType
 
 public enum WelcomeLocationType
 {
-    Chat,
-    Center,
-    Html,
-    Alert
+    Chat,   // 0
+    Center, // 1
+    Html,   // 2
+    Alert   // 3
 }
